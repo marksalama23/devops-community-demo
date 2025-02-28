@@ -1,0 +1,109 @@
+name: CD Deploy Community Databricks Asset Bundle in Development Environment
+
+on:
+   pull_request:
+      types: 
+        - closed
+      branches: 
+        - 'develop'
+      paths: 
+        - 'community_demo/**'
+
+jobs:
+  deploy:
+    environment: dev
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      # Check out this repo, so that this workflow can access it.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            community_demo
+
+      # Download the Databricks CLI.
+      # See https://github.com/databricks/setup-cli
+      - uses: databricks/setup-cli@main
+
+      - name: Logining in into Azure
+        uses: Azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.SP_ID_DBW_CONTRIBUTOR }}","clientSecret":"${{ secrets.SP_SECRET_DBW_CONTRIBUTOR }}","subscriptionId":"${{ secrets.SUBSCRIPTION_ID_COMM_DEMO }}","tenantId":"${{ secrets.TENANT_ID }}"}'
+          enable-AzPSSession: true
+
+      - id: adquire-token
+        name: Adquiring access token
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Az.Accounts -AllowClobber
+
+          $context = Get-AzContext
+
+          $resource = Get-AzAccessToken -ResourceUrl 2ff814a6-3304-4ab8-85cb-cd0e6f879c1d -DefaultProfile $context
+
+          $resourceToken = $resource.Token
+          echo "::set-output name=token::$resourceToken"
+
+          # Save the token to a file for the next job to pick up
+          echo "$resourceToken" > token.txt
+      
+      - name: set-databricks-token
+        run: | 
+          echo "DATABRICKS_TOKEN= ${{ steps.adquire-token.outputs.token }}" >> $GITHUB_ENV
+
+      # Upload the token file as an artifact
+      - name: Upload token as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: databricks-token
+          path: token.txt
+
+      # Deploy the bundle to the "dev" target as defined
+      # in the bundle's settings file.
+      - run: databricks bundle deploy
+        working-directory: ./community_demo
+        env:
+          DATABRICKS_TOKEN: ${{ env.DATABRICKS_TOKEN }}
+          DATABRICKS_BUNDLE_ENV: dev
+
+  # Validate, deploy, and then run the bundle.
+  pipeline_update:
+    name: 'Run pipeline update'
+    environment: dev
+    runs-on: ubuntu-latest
+
+    # Run the "deploy" job first.
+    needs:
+      - deploy
+
+    steps:
+      # Download the token artifact from the deploy job
+      - name: Download Databricks Token
+        uses: actions/download-artifact@v4
+        with:
+          name: databricks-token
+
+      - name: Fetch Databricks Token
+        run: |
+          DATABRICKS_TOKEN=$(cat token.txt)
+          echo "DATABRICKS_TOKEN=$DATABRICKS_TOKEN" >> $GITHUB_ENV
+
+      # Check out this repo, so that this workflow can access it.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: |
+            community_demo
+
+      # Download the Databricks CLI.
+      # See https://github.com/databricks/setup-cli
+      - uses: databricks/setup-cli@main
+
+      # Run the Databricks workflow named "Databricks_Storage_Demo" as defined in the
+      # bundle that was just deployed.
+      - run: databricks bundle run Databricks_Storage_Demo --refresh-all
+        working-directory: ./community_demo
+        env:
+          DATABRICKS_TOKEN: ${{ env.DATABRICKS_TOKEN }}
+          DATABRICKS_BUNDLE_ENV: dev
